@@ -53,6 +53,25 @@ El contenedor espera la siguiente organización de archivos:
 - `README.md`
 - `version_servidor/lrc_checker_server.py`  ← Script principal del servidor web
 
+## Archivos excluidos por .gitignore
+
+- **Archivos temporales / reportes generados**
+  - `reports/`
+  - `*.lrc.tmp`
+
+- **Directorios de trabajo internos**
+  - `__pycache__/`
+  - `*.pyc`
+
+- **Entornos locales**
+  - `.env`
+  - `.env.local`
+
+- **Directorios montados (no subir los volúmenes reales)**
+  - `/music/`
+  - `/reports/`
+
+
 ## 🔧 Mecanismo de funcionamiento
 
 1. Preparar la carpeta con los archivos necesarios para construir la imagen del contenedor.  
