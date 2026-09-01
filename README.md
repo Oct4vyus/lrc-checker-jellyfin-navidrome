@@ -3,6 +3,15 @@
 Contenedor Docker que permite verificar y corregir archivos `.lrc` (letras sincronizadas) en bibliotecas musicales usadas con **Jellyfin** y **Navidrome**. Genera un informe visual (`lrc_report.html`) con categorías de clasificación y herramientas básicas de reparación.
 
 ---
+## 🔌 Requisitos previos
+
+Este contenedor está pensado para quienes ya tienen corriendo alguno de los siguientes plugins:
+
+- **jellyfin-plugin-lyrics**
+- **navidrome-lyrics-plugin**
+
+Estos plugins son los encargados de descargar y buscar los archivos `.lrc` en tu biblioteca musical.  
+El contenedor **LRC Checker** se encarga únicamente de verificar que estén sincronizados y corregirlos si es necesario.
 
 ## ✨ Qué hace
 
@@ -33,6 +42,16 @@ El informe organiza los archivos en las siguientes categorías:
 - **Botón “Reparar”** en la categoría 🟡 Revisar: si la sincronización es correcta, mueve el archivo a ✅ OK.  
 
 ---
+## 📂 Estructura del proyecto
+
+El contenedor espera la siguiente organización de archivos:
+
+- `Dockerfile`
+- `docker-compose.yml`
+- `entrypoint.sh`
+- `.gitignore`
+- `README.md`
+- `version_servidor/lrc_checker_server.py`  ← Script principal del servidor web
 
 ## 🔧 Mecanismo de funcionamiento
 
