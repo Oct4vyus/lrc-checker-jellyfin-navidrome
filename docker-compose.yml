@@ -1,3 +1,4 @@
+
 services:
   lrc-checker:
     image: lrc-checker:local
