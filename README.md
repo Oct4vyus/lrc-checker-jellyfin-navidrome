@@ -37,7 +37,7 @@ El informe organiza los archivos en las siguientes categorías:
 - ℹ️ Huérfanos  
 - ✍️ Firmados  
 
-## Archivos firmados
+## Archivos firmados ✍️
 
 A los archivos `.lrc` generados  manualmente se les pueden incluir un **marcador configurable** con formato[00:00.000] (`SIGNED_MARKER`) para identificar que fueron sincronizados a mano.  
 Este marcador se inserta en un tramo sin letra cantada (intro, final o pasaje instrumental), de modo que no interfiera con la visualizacion de la letra de la canción.
