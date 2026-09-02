@@ -36,6 +36,18 @@ El informe organiza los archivos en las siguientes categorías:
 - ℹ️ Huérfanos  
 - ✍️ Firmados  
 
+## Archivos firmados
+
+A los archivos `.lrc` generados  manualmente se les pueden incluir un **marcador configurable** con formato[00:00.000] (`SIGNED_MARKER`) para identificar que fueron sincronizados a mano.  
+Este marcador se inserta en un tramo sin letra cantada (intro, final o pasaje instrumental), de modo que no interfiera con la visualizacion de la letra de la canción.
+Aclaración: Si el timestamps [00:00.000](`SIGNED_MARKER`) se pone al final, no influye sobre las clasificacion en otras categorias. Ya que muchas dependen de la diferencias de tiempo 
+de tiempo entre el  último timestamps y el tiempo esperado total de la canción.
+Ejemplo de configuración en `docker-compose.yml`:
+
+```yaml
+environment:
+  - SIGNED_MARKER=Oct4vyus Kandle
+
 ### Funcionalidades del informe
 - **Barra de progreso**: muestra el porcentaje de archivos en estado ✅ OK respecto al total.  
 - **Botón “Escanear ahora”**: relanza la verificación completa de la biblioteca.  
@@ -132,3 +144,9 @@ Ideal para colecciones grandes donde la sincronización es importante.
 
 📜 Licencia
 MIT License
+
+## Captura de pantalla del informe
+
+El siguiente ejemplo muestra un reporte generado por **LRC Checker v2.0.0**, donde se resumen los resultados del escaneo de la biblioteca:
+
+![Captura de pantalla del informe](docs/imagenes/lrc-checker-report.png)
