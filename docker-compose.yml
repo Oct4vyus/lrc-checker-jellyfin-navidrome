@@ -17,6 +17,8 @@ services:
       # Mostrar progreso detallado en los logs
       - VERBOSE=true
       - SERVER_URL=http://CAMBIAR-POR-IP-DE-TU-SERVIDOR:8080
+      # Opcional. Si no la ponés, se usa "Oct4vyus Kandle" 
+      - SIGNED_MARKER=Oct4vyus Kandle
 
     # Volúmenes: monta tu biblioteca de música y directorio de reportes
     volumes:

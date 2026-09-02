@@ -83,14 +83,14 @@ class LrcChecker:
     OFFSET_PATTERN = re.compile(r'\[offset:([+-]?\d+)\]', re.IGNORECASE)
 
     # Marca de archivo "firmado" (ya revisado/corregido manualmente).
-    # Texto literal, case-sensitive, tal como lo confirmó el usuario.
-    # Puede aparecer con o sin espacio después del timestamp que la precede.
+    # Texto literal, case-sensitive por defecto. Configurable por instancia
+    # (ver __init__) para poder cambiarla desde --signed-marker / la variable
+    # de entorno SIGNED_MARKER, sin tocar el código.
     SIGNED_MARKER = "Oct4vyus Kandle"
-    SIGNED_MARKER_PATTERN = re.compile(re.escape(SIGNED_MARKER))
 
     def __init__(self, music_dir: str, verbose: bool = False, check_orphans: bool = True,
                  sync_tolerance_sec: float = 5.0, enable_sync_check: bool = True,
-                 review_threshold_sec: float = 60.0):
+                 review_threshold_sec: float = 60.0, signed_marker: Optional[str] = None):
         self.music_dir = Path(music_dir).resolve()
         self.verbose = verbose
         self.check_orphans = check_orphans
@@ -100,6 +100,10 @@ class LrcChecker:
         # en vez de un probable outro/fade-out normal. Ver discusión: esto es
         # una estimación basada en distribución observada, no un valor exacto.
         self.review_threshold_sec = review_threshold_sec
+        # Si no se pasa nada, usa el valor histórico "Oct4vyus Kandle" (compatibilidad
+        # hacia atrás: los .lrc ya firmados con ese texto se siguen reconociendo).
+        self.signed_marker = signed_marker if signed_marker else self.SIGNED_MARKER
+        self.signed_marker_pattern = re.compile(re.escape(self.signed_marker))
         self.results: List[LrcCheckResult] = []
         self.stats = {
             'total_audio_files': 0,
@@ -188,7 +192,7 @@ class LrcChecker:
                 continue
 
             # Ignorar la línea de firma si se pidió excluirla
-            if exclude_signed_line and self.SIGNED_MARKER_PATTERN.search(line):
+            if exclude_signed_line and self.signed_marker_pattern.search(line):
                 continue
             
             # Timestamps estándar [mm:ss.xx]
@@ -272,7 +276,7 @@ class LrcChecker:
             return result
         
         # Detectar si el archivo ya fue revisado/corregido manualmente (firma)
-        result.is_signed = bool(self.SIGNED_MARKER_PATTERN.search(content))
+        result.is_signed = bool(self.signed_marker_pattern.search(content))
 
         # Verificar si está vacío
         if not content or not content.strip():
@@ -1043,6 +1047,9 @@ Ejemplos:
                              'Si se pasa un archivo .lrc específico, solo repara ese. '
                              'Sin argumento, repara todos los archivos en REVIEW.')
     parser.add_argument('--exit-zero', action='store_true', help='Salir con código 0 aunque haya problemas (útil para loops continuos)')
+    parser.add_argument('--signed-marker', type=str, default=None,
+                        help='Texto que marca un .lrc como "firmado" (ya revisado manualmente). '
+                             'Por defecto: "Oct4vyus Kandle" (compatibilidad con archivos ya firmados).')
     
     args = parser.parse_args()
     
@@ -1064,7 +1071,8 @@ Ejemplos:
         check_orphans=not args.no_orphans,
         sync_tolerance_sec=args.tolerance,
         enable_sync_check=not args.no_sync_check,
-        review_threshold_sec=args.review_threshold
+        review_threshold_sec=args.review_threshold,
+        signed_marker=args.signed_marker
     )
     checker.scan()
 

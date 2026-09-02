@@ -37,17 +37,29 @@ if [ ! -d "$MUSIC_DIR" ]; then
     exit 1
 fi
 
-FLAGS="--tolerance ${SYNC_TOLERANCE_SEC:-5.0} --review-threshold ${REVIEW_THRESHOLD_SEC:-60.0} --exit-zero"
+# Armamos los argumentos con "set --" (positional params) en vez de una
+# variable de texto: si concatenáramos strings y expandiéramos sin comillas,
+# un valor con espacios (como SIGNED_MARKER="Oct4vyus Kandle") se partiría
+# en dos argumentos sueltos por el word-splitting del shell. "set --" preserva
+# cada argumento como una unidad, tenga o no espacios.
+set -- "$MUSIC_DIR" --html --json -o "$OUTPUT_DIR" \
+    --server-url "${SERVER_URL:-http://localhost:8080}" \
+    --tolerance "${SYNC_TOLERANCE_SEC:-5.0}" \
+    --review-threshold "${REVIEW_THRESHOLD_SEC:-60.0}" \
+    --exit-zero --serve
+
+if [ -n "$SIGNED_MARKER" ]; then
+    set -- "$@" --signed-marker "$SIGNED_MARKER"
+fi
 
 if [ "$VERBOSE" = "true" ]; then
-    FLAGS="$FLAGS --verbose"
+    set -- "$@" --verbose
 fi
 
 if [ "$CHECK_ORPHANS" != "true" ]; then
-    FLAGS="$FLAGS --no-orphans"
+    set -- "$@" --no-orphans
 fi
 
 # --serve hace el escaneo inicial, genera los reportes, y luego se queda
 # corriendo el servidor HTTP (no vuelve al shell).
-exec python /app/lrc_checker.py "$MUSIC_DIR" --html --json -o "$OUTPUT_DIR" \
-    --server-url "${SERVER_URL:-http://localhost:8080}" --serve $FLAGS
+exec python /app/lrc_checker.py "$@"
