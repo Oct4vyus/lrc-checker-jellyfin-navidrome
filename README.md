@@ -1,6 +1,6 @@
 # 🎵 LRC Checker para Jellyfin y Navidrome
 
-Contenedor Docker que permite verificar y corregir archivos `.lrc` (letras sincronizadas) en bibliotecas musicales usadas con **Jellyfin** y **Navidrome**. Genera un informe visual (`lrc_report.html`) con categorías de clasificación y herramientas básicas de reparación.
+Contenedor Docker que permite verificar y corregir archivos `.lrc` (letras sincronizadas) en bibliotecas musicales usadas con **Jellyfin** y **Navidrome**. Genera un informe visual (`lrc_report.htm[...]
 
 ---
 ## 🔌 Requisitos previos
@@ -47,6 +47,7 @@ Ejemplo de configuración en `docker-compose.yml`:
 ```yaml
 environment:
   - SIGNED_MARKER=Oct4vyus Kandle
+```
 
 ### Funcionalidades del informe
 - **Barra de progreso**: muestra el porcentaje de archivos en estado ✅ OK respecto al total.  
@@ -127,6 +128,7 @@ docker-compose build
 
 # Levantar contenedor
 docker-compose up -d
+```
 
 Luego abrir en el navegador:
 
