@@ -1,7 +1,8 @@
-
 # 🎵 LRC Checker para Jellyfin y Navidrome
 
-Contenedor Docker que permite verificar y corregir archivos `.lrc` (letras sincronizadas) en bibliotecas musicales usadas con **Jellyfin** y **Navidrome**. Genera un informe visual (`lrc_report.html`) con categorías de clasificación y herramientas básicas de reparación.
+Contenedor Docker que permite verificar y corregir archivos `.lrc` (letras sincronizadas) en bibliotecas musicales usadas con 
+**Jellyfin** y **Navidrome**. Genera un informe visual (`lrc_report.html`) con categorías de clasificación y herramientas 
+básicas de reparación.
 
 ---
 ## 🔌 Requisitos previos
@@ -17,7 +18,7 @@ El contenedor **LRC Checker** se encarga únicamente de verificar que estén sin
 ## ✨ Qué hace
 
 - Compara el **último timestamp** del archivo `.lrc` con la **duración real del audio**, aplicando una **tolerancia configurable**.
-- Clasifica los resultados en 9 categorías dentro de `lrc_report.html`.
+- Clasifica los resultados en 10 categorías dentro de `lrc_report.html`.
 - La revisión es **on demand**: se inicia manualmente desde el navegador.
 - Además de verificar, puede **editar y corregir** archivos en ciertas categorías.
 
@@ -26,33 +27,51 @@ El contenedor **LRC Checker** se encarga únicamente de verificar que estén sin
 ## 📊 Informe generado (`lrc_report.html`)
 
 El informe organiza los archivos en las siguientes categorías:
-
+- Todos
 - ✅ OK  
 - ❌ Missing  
 - ⚠️ Empty  
-- ⚠️ Unsynced  
+- ⚠️ Unsynced
+- 🎼 INSTRUMENTAL
 - 🟡 Revisar  
 - 🔴 Desync  
 - ❌ Corrupt  
 - ℹ️ Huérfanos  
 - ✍️ Firmados  
 
-## Archivos firmados ✍️
+## INSTRUMENTAL 🎼️
 
-A los archivos `.lrc` generados  manualmente se les pueden incluir un **marcador configurable** con formato[00:00.000] (`SIGNED_MARKER`) para identificar que fueron sincronizados a mano.  
-Este marcador se inserta en un tramo sin letra cantada (intro, final o pasaje instrumental), de modo que no interfiera con la visualizacion de la letra de la canción.
-Aclaración: Si el timestamps [00:00.000](`SIGNED_MARKER`) se pone al final, no influye sobre las clasificacion en otras categorias. Ya que muchas dependen de la diferencias de tiempo 
-de tiempo entre el  último timestamps y el tiempo esperado total de la canción.
+A los archivos de la biblioteca  musical que no tienen letra, se les editará un archivo `.lrc`sin timestamps, pero con una línea descriptiva
+"This song is an instrumental", sin comillas.
+Si un .lrc no tiene timestamps y su contenido coincide con esa línea descripta, se marca como:
+- INSTRUMENTAL
+
+## 🟡 Revisar  y ## 🔴 Desync
+
+Ambas categorías tienen en cada uno de los archivos .lrc listados, un boton "reparar". Si se ha verificado que el archivo es correcto y está 
+sincronizado, este boton le agrega un timestamps al final con la duracion real del tema, por lo cual pasa a categoria OK. Antes de esta edición
+automática, se guarda un backup del archivo .lrc.
+
+## Firmados 🎼️
+
+A los archivos `.lrc` generados  manualmente se les pueden incluir un **marcador configurable** con formato[00:00.000] (`SIGNED_MARKER`) para 
+identificar que fueron sincronizados a mano.  
+Este marcador se inserta en un tramo sin letra cantada (intro, final o pasaje instrumental), de modo que no interfiera con la visualizacion de 
+la letra de la canción.
+Aclaración: Si el timestamps [00:00.000](`SIGNED_MARKER`) se pone al final, no influye sobre las clasificacion en otras categorias. 
+Ya que muchas dependen de la diferencias de tiempo entre el  último timestamps y el tiempo esperado total de la canción.
+
 Ejemplo de configuración en `docker-compose.yml`:
-
-```yaml
+```bash
 environment:
   - SIGNED_MARKER=Oct4vyus Kandle
+ ```bash
+Sino se establece otra, Oct4vyus Kandle es la firma por defecto.
 
 ### Funcionalidades del informe
 - **Barra de progreso**: muestra el porcentaje de archivos en estado ✅ OK respecto al total.  
-- **Botón “Escanear ahora”**: relanza la verificación completa de la biblioteca.  
-- **Botón “Reparar”** en la categoría 🟡 Revisar: si la sincronización es correcta, mueve el archivo a ✅ OK.  
+- **Botón “Escanear ahora”**: relanza la verificación completa de la biblioteca muestra una barra de progreso.  
+- **Botón “Reparar”** en la categoría 🟡 Revisar y 🔴 Desync: si la sincronización es correcta, mueve el archivo a ✅ OK.  
 
 ---
 ## 📂 Estructura del proyecto
@@ -128,6 +147,8 @@ docker-compose build
 
 # Levantar contenedor
 docker-compose up -d
+
+```bash
 
 Luego abrir en el navegador:
 
