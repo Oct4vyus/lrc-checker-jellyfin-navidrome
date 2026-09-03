@@ -13,6 +13,7 @@ import sys
 import json
 import re
 import argparse
+import threading
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -37,6 +38,7 @@ except ImportError:
 
 class CheckStatus(Enum):
     OK = "ok"                    # Todo correcto: LRC presente, sincronizado y alineado con audio
+    INSTRUMENTAL = "instrumental"  # LRC descriptivo para una canción sin letra
     MISSING = "missing"          # No tiene archivo .lrc
     EMPTY = "empty"              # Archivo .lrc vacío
     UNSYNCED = "unsynced"        # Archivo .lrc sin timestamps
@@ -81,6 +83,10 @@ class LrcChecker:
     
     # Offset tag [offset:+/-milliseconds]
     OFFSET_PATTERN = re.compile(r'\[offset:([+-]?\d+)\]', re.IGNORECASE)
+    INSTRUMENTAL_TEXT_PATTERN = re.compile(
+        r'^\s*this\s+song\s+is\s+an\s+instrumental\s*\.?\s*$',
+        re.IGNORECASE
+    )
 
     # Marca de archivo "firmado" (ya revisado/corregido manualmente).
     # Texto literal, case-sensitive por defecto. Configurable por instancia
@@ -105,10 +111,19 @@ class LrcChecker:
         self.signed_marker = signed_marker if signed_marker else self.SIGNED_MARKER
         self.signed_marker_pattern = re.compile(re.escape(self.signed_marker))
         self.results: List[LrcCheckResult] = []
+        # Progreso del escaneo en curso, consultado por el endpoint /progreso.
+        # scan_lock: mientras está tomado, hay un escaneo corriendo en un hilo
+        # aparte. Se usa para bloquear /reparar durante ese lapso (self.results
+        # se reconstruye desde cero al escanear, y tocarlo a la mitad podría
+        # dar un resultado inconsistente o, en el peor caso, un error de
+        # "lista modificada durante iteración").
+        self.scan_progress = {'running': False, 'current': 0, 'total': 0, 'current_file': '', 'error': None}
+        self.scan_lock = threading.Lock()
         self.stats = {
             'total_audio_files': 0,
             'total_lrc_files': 0,
             'ok': 0,
+            'instrumental': 0,
             'missing': 0,
             'empty': 0,
             'unsynced': 0,
@@ -294,8 +309,12 @@ class LrcChecker:
         result.line_count = line_count
         
         if not has_ts:
-            result.status = CheckStatus.UNSYNCED.value
-            result.details = f"Sin sincronización: {line_count} líneas de texto, 0 timestamps"
+            if self.INSTRUMENTAL_TEXT_PATTERN.fullmatch(content.strip()):
+                result.status = CheckStatus.INSTRUMENTAL.value
+                result.details = "Canción instrumental: archivo .lrc descriptivo sin timestamps"
+            else:
+                result.status = CheckStatus.UNSYNCED.value
+                result.details = f"Sin sincronización: {line_count} líneas de texto, 0 timestamps"
             return result
         
         # A partir de aquí: tiene timestamps. Verificar sincronización con audio si es posible.
@@ -368,6 +387,7 @@ class LrcChecker:
             'total_audio_files': 0,
             'total_lrc_files': 0,
             'ok': 0,
+            'instrumental': 0,
             'missing': 0,
             'empty': 0,
             'unsynced': 0,
@@ -383,7 +403,10 @@ class LrcChecker:
             self.log("ADVERTENCIA: Verificación de sincronización con audio desactivada (mutagen no disponible)")
         else:
             self.log(f"Tolerancia de sincronización: {self.sync_tolerance_sec}s")
-        
+
+        self.scan_progress.update({'running': True, 'current': 0, 'total': 0,
+                                    'current_file': 'Buscando archivos...', 'error': None})
+
         audio_files: List[Path] = []
         lrc_files: List[Path] = []
         
@@ -400,15 +423,18 @@ class LrcChecker:
         self.stats['total_lrc_files'] = len(lrc_files)
         self.log(f"Archivos de audio encontrados: {len(audio_files)}")
         self.log(f"Archivos .lrc encontrados: {len(lrc_files)}")
+        self.scan_progress['total'] = len(audio_files)
         
         matched_lrc = set()
         
         # Verificar cada archivo de audio
-        for audio_path in audio_files:
+        for i, audio_path in enumerate(audio_files, start=1):
             rel_path = audio_path.relative_to(self.music_dir)
             lrc_path = audio_path.with_suffix('.lrc')
             
             self.log(f"Verificando: {rel_path}")
+            self.scan_progress['current'] = i
+            self.scan_progress['current_file'] = str(rel_path)
             
             if lrc_path.exists():
                 matched_lrc.add(lrc_path.resolve())
@@ -430,6 +456,7 @@ class LrcChecker:
         
         # Verificar archivos .lrc huérfanos
         if self.check_orphans:
+            self.scan_progress['current_file'] = 'Verificando huérfanos...'
             for lrc_path in lrc_files:
                 if lrc_path.resolve() not in matched_lrc:
                     rel_path = lrc_path.relative_to(self.music_dir)
@@ -441,12 +468,13 @@ class LrcChecker:
                     self.stats['orphan_lrc'] += 1
                     if result.is_signed:
                         self.stats['signed'] += 1
-        
+
+        self.scan_progress.update({'running': False, 'current_file': 'Completo'})
         return self.results
 
     def reparar_lrc(self, result: LrcCheckResult) -> bool:
-        """Repara un archivo .lrc en estado REVIEW agregando un timestamp final con la duración real."""
-        if result.status != CheckStatus.REVIEW.value:
+        """Repara un .lrc REVIEW o DESYNCED agregando un timestamp final."""
+        if result.status not in (CheckStatus.REVIEW.value, CheckStatus.DESYNCED.value):
             return False
         if not result.lrc_file or not result.audio_duration_sec:
             return False
@@ -466,7 +494,7 @@ class LrcChecker:
             # No se marca como firmado: eso es solo para archivos con "Oct4vyus Kandle"
             # Actualizamos las stats en memoria para que un generate_html_report()
             # posterior refleje el cambio SIN necesidad de re-escanear todo el disco.
-            self.stats['review'] = max(0, self.stats.get('review', 0) - 1)
+            self.stats[result.status] = max(0, self.stats.get(result.status, 0) - 1)
             self.stats['ok'] = self.stats.get('ok', 0) + 1
             result.status = CheckStatus.OK.value
             result.details = f"Reparado: timestamp final agregado ({final_timestamp}) con duración real {self._fmt_time(duration)}"
@@ -490,6 +518,7 @@ class LrcChecker:
                 'total_audio_files': self.stats['total_audio_files'],
                 'total_lrc_files': self.stats['total_lrc_files'],
                 'ok': self.stats.get('ok', 0),
+                'instrumental': self.stats.get('instrumental', 0),
                 'missing': self.stats.get('missing', 0),
                 'empty': self.stats.get('empty', 0),
                 'unsynced': self.stats.get('unsynced', 0),
@@ -501,7 +530,8 @@ class LrcChecker:
             },
             'summary': {
                 'coverage_percent': round(
-                    (self.stats.get('ok', 0) / max(self.stats['total_audio_files'], 1)) * 100, 2
+                    ((self.stats.get('ok', 0) + self.stats.get('instrumental', 0)) /
+                     max(self.stats['total_audio_files'], 1)) * 100, 2
                 ),
                 'issues_count': (
                     self.stats.get('missing', 0) +
@@ -543,6 +573,7 @@ class LrcChecker:
         
         status_classes = {
             'ok': 'status-ok',
+            'instrumental': 'status-instrumental',
             'missing': 'status-missing',
             'empty': 'status-empty',
             'unsynced': 'status-unsynced',
@@ -554,6 +585,7 @@ class LrcChecker:
         
         status_labels = {
             'ok': '✅ OK',
+            'instrumental': '🎼 INSTRUMENTAL',
             'missing': '❌ Falta .lrc',
             'empty': '⚠️ .lrc Vacío',
             'unsynced': '⚠️ Sin Sincronizar',
@@ -581,9 +613,9 @@ class LrcChecker:
             signed_class = " row-signed" if r.is_signed else ""
             signed_info = "<span class='signed-badge' title=\"Contiene la marca de firma\">✍️ Firmado</span>" if r.is_signed else ""
             
-            # Botón Reparar solo para archivos en REVIEW
+            # Botón Reparar para archivos en REVIEW o DESYNCED
             repair_btn = ""
-            if r.status == CheckStatus.REVIEW.value and r.lrc_file:
+            if r.status in (CheckStatus.REVIEW.value, CheckStatus.DESYNCED.value) and r.lrc_file:
                 lrc_js = r.lrc_file.replace('\\', '\\\\').replace("'", "\\'")
                 repair_btn = f'<button onclick="repararLrc(\'{lrc_js}\')" class="repair-btn">Reparar</button>'
 
@@ -604,6 +636,7 @@ class LrcChecker:
         # Estadísticas
         total = self.stats['total_audio_files']
         ok = self.stats.get('ok', 0)
+        instrumental = self.stats.get('instrumental', 0)
         missing = self.stats.get('missing', 0)
         empty = self.stats.get('empty', 0)
         unsynced = self.stats.get('unsynced', 0)
@@ -612,7 +645,7 @@ class LrcChecker:
         corrupt = self.stats.get('corrupt', 0)
         orphan = self.stats.get('orphan_lrc', 0)
         signed = self.stats.get('signed', 0)
-        coverage = round((ok / max(total, 1)) * 100, 1)
+        coverage = round(((ok + instrumental) / max(total, 1)) * 100, 1)
         sync_check_badge = "<span class='badge'>con mutagen</span>" if self.enable_sync_check else "<span class='badge warn'>sin mutagen</span>"
         
         html = f"""<!DOCTYPE html>
@@ -630,6 +663,7 @@ class LrcChecker:
             --text-muted: #8888aa;
             --accent: #6c5ce7;
             --ok: #00b894;
+            --instrumental: #a78bfa;
             --missing: #e74c3c;
             --empty: #f39c12;
             --unsynced: #e67e22;
@@ -667,6 +701,7 @@ class LrcChecker:
         .stat-card .number {{ font-size: 1.8rem; font-weight: bold; }}
         .stat-card .label {{ color: var(--text-muted); font-size: 0.85rem; margin-top: 4px; }}
         .stat-ok {{ color: var(--ok); }}
+        .stat-instrumental {{ color: var(--instrumental); }}
         .stat-missing {{ color: var(--missing); }}
         .stat-empty {{ color: var(--empty); }}
         .stat-unsynced {{ color: var(--unsynced); }}
@@ -744,6 +779,7 @@ class LrcChecker:
         .status-missing {{ border-left: 4px solid var(--missing); }}
         .status-empty {{ border-left: 4px solid var(--empty); }}
         .status-unsynced {{ border-left: 4px solid var(--unsynced); }}
+        .status-instrumental {{ border-left: 4px solid var(--instrumental); }}
         .status-review {{ border-left: 4px solid var(--review); }}
         .status-desynced {{ border-left: 4px solid var(--desynced); }}
         .status-corrupt {{ border-left: 4px solid var(--corrupt); }}
@@ -814,12 +850,16 @@ class LrcChecker:
     <div class="container">
         <h1>🎵 LRC Checker Report</h1>
         <p class="subtitle">{self.music_dir} | Escaneado: {self.stats['scanned_at']}</p>
-        <p class="version">LRC Checker v2.0.0 {sync_check_badge} | Tolerancia OK: {self.sync_tolerance_sec}s | Umbral revisión/error: {self.review_threshold_sec}s</p>
+        <p class="version">LRC Checker v3.0.0 {sync_check_badge} | Tolerancia OK: {self.sync_tolerance_sec}s | Umbral revisión/error: {self.review_threshold_sec}s</p>
         
         <div class="stats-grid">
             <div class="stat-card">
                 <div class="number stat-ok">{ok}</div>
                 <div class="label">OK</div>
+            </div>
+            <div class="stat-card">
+                <div class="number stat-instrumental">{instrumental}</div>
+                <div class="label">INSTRUMENTAL</div>
             </div>
             <div class="stat-card">
                 <div class="number stat-missing">{missing}</div>
@@ -847,7 +887,7 @@ class LrcChecker:
             </div>
             <div class="stat-card">
                 <div class="number stat-coverage">{coverage}%</div>
-                <div class="label">Cobertura OK</div>
+                <div class="label">Cobertura válida</div>
             </div>
             <div class="stat-card">
                 <div class="number" style="color: var(--accent);">{signed}</div>
@@ -865,6 +905,7 @@ class LrcChecker:
             <button onclick="filterRows('missing')">❌ Missing ({missing})</button>
             <button onclick="filterRows('empty')">⚠️ Empty ({empty})</button>
             <button onclick="filterRows('unsynced')">⚠️ Unsynced ({unsynced})</button>
+            <button onclick="filterRows('instrumental')">🎼 INSTRUMENTAL ({instrumental})</button>
             <button onclick="filterRows('review')">🟡 Revisar ({review})</button>
             <button onclick="filterRows('desynced')">🔴 Desync ({desynced})</button>
             <button onclick="filterRows('corrupt')">❌ Corrupt ({corrupt})</button>
@@ -899,6 +940,11 @@ class LrcChecker:
         <div style="text-align:center; margin-top: 10px;">
             <button onclick="escanearAhora()" id="scanBtn" class="repair-btn" style="background: var(--accent);">🔄 Escanear ahora</button>
             <span id="scanStatus" style="color: var(--text-muted); margin-left: 10px;"></span>
+            <div id="scanProgressWrap" style="display:none; max-width: 500px; margin: 10px auto 0;">
+                <div style="background: rgba(255,255,255,0.08); border-radius: 8px; overflow: hidden; height: 18px;">
+                    <div id="scanProgressBar" style="background: var(--accent); height: 100%; width: 0%; transition: width 0.3s;"></div>
+                </div>
+            </div>
         </div>
     </div>
     
@@ -951,17 +997,52 @@ class LrcChecker:
         function escanearAhora() {{
             const btn = document.getElementById('scanBtn');
             const status = document.getElementById('scanStatus');
+            const wrap = document.getElementById('scanProgressWrap');
             btn.disabled = true;
-            status.textContent = 'Escaneando... esto puede tardar según el tamaño de tu biblioteca.';
+            status.textContent = 'Iniciando escaneo...';
 
             fetch(REPAIR_SERVER_URL + '/escanear', {{ method: 'POST' }})
-                .then(r => r.text())
-                .then(text => {{
-                    status.textContent = text;
-                    location.reload();
+                .then(r => r.text().then(text => ({{ ok: r.ok, text }})))
+                .then(({{ ok, text }}) => {{
+                    if (!ok) {{
+                        // 409: ya hay un escaneo en curso (de otra pestaña, u otra persona).
+                        // Igual arrancamos el polling para mostrar SU progreso, no lo tratamos como error fatal.
+                        status.textContent = text;
+                    }}
+                    wrap.style.display = 'block';
+                    pollProgresoEscaneo();
                 }})
                 .catch(err => {{
-                    status.textContent = 'Error al conectar con el servidor: ' + err;
+                    status.textContent = 'No se pudo conectar con ' + REPAIR_SERVER_URL + ': ' + err;
+                    btn.disabled = false;
+                }});
+        }}
+
+        function pollProgresoEscaneo() {{
+            const status = document.getElementById('scanStatus');
+            const bar = document.getElementById('scanProgressBar');
+            const btn = document.getElementById('scanBtn');
+
+            fetch(REPAIR_SERVER_URL + '/progreso')
+                .then(r => r.json())
+                .then(data => {{
+                    if (data.error) {{
+                        status.textContent = 'Error durante el escaneo: ' + data.error;
+                        btn.disabled = false;
+                        return;
+                    }}
+                    if (data.corriendo) {{
+                        bar.style.width = data.porcentaje + '%';
+                        status.textContent = `Escaneando... ${{data.actual}}/${{data.total}} (${{data.porcentaje}}%) — ${{data.archivo}}`;
+                        setTimeout(pollProgresoEscaneo, 800);
+                    }} else {{
+                        bar.style.width = '100%';
+                        status.textContent = 'Escaneo completo. Recargando...';
+                        setTimeout(() => location.reload(), 500);
+                    }}
+                }})
+                .catch(err => {{
+                    status.textContent = 'Se perdió la conexión consultando el progreso: ' + err;
                     btn.disabled = false;
                 }});
         }}
@@ -978,7 +1059,7 @@ class LrcChecker:
         """Genera un reporte de texto simple para logs."""
         lines = [
             "=" * 65,
-            "  LRC CHECKER REPORT v2.0.0",
+            "  LRC CHECKER REPORT v3.0.0",
             "=" * 65,
             f"Directorio: {self.music_dir}",
             f"Escaneado:  {self.stats['scanned_at']}",
@@ -990,6 +1071,7 @@ class LrcChecker:
             "",
             "  RESULTADOS:",
             f"    ✅ OK:              {self.stats.get('ok', 0)}",
+            f"    🎼 INSTRUMENTAL:    {self.stats.get('instrumental', 0)}",
             f"    ❌ Sin .lrc:        {self.stats.get('missing', 0)}",
             f"    ⚠️  .lrc Vacíos:    {self.stats.get('empty', 0)}",
             f"    ⚠️  Sin timestamps:  {self.stats.get('unsynced', 0)}",
@@ -999,12 +1081,13 @@ class LrcChecker:
             f"    ℹ️  Huérfanos:       {self.stats.get('orphan_lrc', 0)}",
             f"    ✍️  Firmados:        {self.stats.get('signed', 0)} (excluidos del cálculo de sync)",
             "",
-            f"  Cobertura OK: {round((self.stats.get('ok', 0) / max(self.stats['total_audio_files'], 1)) * 100, 1)}%",
+            f"  Cobertura válida: {round(((self.stats.get('ok', 0) + self.stats.get('instrumental', 0)) / max(self.stats['total_audio_files'], 1)) * 100, 1)}%",
             "=" * 65,
         ]
         
         # Listar problemas
-        issues = [r for r in self.results if r.status != CheckStatus.OK.value]
+        issues = [r for r in self.results
+                  if r.status not in (CheckStatus.OK.value, CheckStatus.INSTRUMENTAL.value)]
         if issues:
             lines.append("\n  ARCHIVOS CON PROBLEMAS:")
             for r in issues[:50]:
@@ -1081,7 +1164,7 @@ Ejemplos:
         repaired = 0
         if args.reparar == 'all':
             for r in checker.results:
-                if r.status == CheckStatus.REVIEW.value:
+                if r.status in (CheckStatus.REVIEW.value, CheckStatus.DESYNCED.value):
                     if checker.reparar_lrc(r):
                         repaired += 1
         else:
@@ -1183,10 +1266,12 @@ try:
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == '/escanear':
                 self._handle_escanear()
+            elif parsed.path == '/progreso':
+                self._handle_progreso()
             elif parsed.path == '/status':
                 self._send(200, 'ok')
             else:
-                self._send(404, 'Ruta no encontrada. Usá POST /reparar?archivo=... o POST /escanear')
+                self._send(404, 'Ruta no encontrada. Usá POST /reparar?archivo=..., POST /escanear o GET /progreso')
 
         def _handle_reparar(self, query):
             archivo = query.get('archivo', [''])[0]
@@ -1195,6 +1280,13 @@ try:
                 return
 
             checker = RepairHandler.checker
+
+            # Si hay un escaneo corriendo en background, self.results se está
+            # reconstruyendo desde cero en otro hilo: no tocarlo ahora.
+            if checker.scan_lock.locked():
+                self._send(409, 'Hay un escaneo en curso. Esperá a que termine (consultá /progreso) antes de reparar.')
+                return
+
             try:
                 lrc_path = Path(archivo).resolve()
             except Exception as e:
@@ -1228,10 +1320,10 @@ try:
                 self._send(404, 'Ese archivo no está en el último escaneo. Probá "Escanear ahora" y reintentá.')
                 return
 
-            if result.status != CheckStatus.REVIEW.value:
+            if result.status not in (CheckStatus.REVIEW.value, CheckStatus.DESYNCED.value):
                 # Evita duplicar el timestamp final si se hace doble clic o si el
                 # archivo ya fue reparado en una petición anterior.
-                self._send(409, f'Este archivo ya no está en estado REVISAR (estado actual: "{result.status}"). No se modifica, para no duplicar el timestamp final.')
+                self._send(409, f'Este archivo ya no está en estado REVISAR o DESINCRONIZADO (estado actual: "{result.status}"). No se modifica, para no duplicar el timestamp final.')
                 return
 
             # Backup del .lrc original antes de tocarlo, una única vez.
@@ -1252,11 +1344,55 @@ try:
 
         def _handle_escanear(self):
             checker = RepairHandler.checker
-            checker.scan()
-            checker.generate_html_report(RepairHandler.html_path, server_base_url=RepairHandler.server_url)
-            checker.generate_json_report(RepairHandler.json_path)
-            self._send(200, f"Escaneo completo: {checker.stats.get('review', 0)} archivo(s) en estado REVISAR, "
-                             f"{checker.stats.get('ok', 0)} OK de {checker.stats.get('total_audio_files', 0)} total.")
+            # No bloqueante: si ya hay un escaneo corriendo, avisamos y no
+            # arrancamos uno nuevo (evitaría dos hilos pisándose self.results).
+            if not checker.scan_lock.acquire(blocking=False):
+                self._send(409, 'Ya hay un escaneo en curso. Consultá /progreso para ver el avance.')
+                return
+
+            thread = threading.Thread(target=RepairHandler._run_scan_background,
+                                       args=(checker,), daemon=True)
+            thread.start()
+            self._send(202, 'Escaneo iniciado en background. Consultá GET /progreso para ver el avance.')
+
+        @staticmethod
+        def _run_scan_background(checker: 'LrcChecker'):
+            # Corre en un hilo aparte para no bloquear el servidor HTTP:
+            # así el botón puede seguir consultando /progreso mientras escanea.
+            try:
+                checker.scan()
+                checker.generate_html_report(RepairHandler.html_path, server_base_url=RepairHandler.server_url)
+                checker.generate_json_report(RepairHandler.json_path)
+            except Exception as e:
+                checker.scan_progress['error'] = str(e)
+                checker.scan_progress['running'] = False
+            finally:
+                # Libera el lock SIEMPRE, incluso si scan() ya lo había puesto
+                # en running=False por su cuenta al terminar normalmente.
+                checker.scan_lock.release()
+
+        def _handle_progreso(self):
+            checker = RepairHandler.checker
+            p = checker.scan_progress
+            total = p.get('total', 0)
+            current = p.get('current', 0)
+            pct = round((current / total * 100), 1) if total else 0.0
+            payload = {
+                'corriendo': p.get('running', False),
+                'actual': current,
+                'total': total,
+                'porcentaje': pct,
+                'archivo': p.get('current_file', ''),
+                'error': p.get('error'),
+            }
+            body = json.dumps(payload, ensure_ascii=False)
+            encoded = body.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Content-Length', str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
 
         def log_message(self, fmt, *args):
             # Silenciar logs por request del servidor HTTP estándar.
