@@ -1,3 +1,4 @@
+
 # 🎵 LRC Checker para Jellyfin y Navidrome
 
 Contenedor Docker que permite verificar y corregir archivos `.lrc` (letras sincronizadas) en bibliotecas musicales usadas con 
@@ -65,7 +66,7 @@ Ejemplo de configuración en `docker-compose.yml`:
 ```bash
 environment:
   - SIGNED_MARKER=Oct4vyus Kandle
- ```bash
+ ```
 Sino se establece otra, Oct4vyus Kandle es la firma por defecto.
 
 ### Funcionalidades del informe
@@ -148,7 +149,7 @@ docker-compose build
 # Levantar contenedor
 docker-compose up -d
 
-```bash
+```
 
 Luego abrir en el navegador:
 
