@@ -66,7 +66,8 @@ Ejemplo de configuración en `docker-compose.yml`:
 ```bash
 environment:
   - SIGNED_MARKER=Oct4vyus Kandle
- ```bash
+```
+
 Sino se establece otra, Oct4vyus Kandle es la firma por defecto.
 
 ### Funcionalidades del informe
@@ -149,6 +150,7 @@ docker-compose build
 # Levantar contenedor
 docker-compose up -d
 
+
 ```bash
 
 Luego abrir en el navegador:
@@ -173,5 +175,3 @@ MIT License
 El siguiente ejemplo muestra un reporte generado por **LRC Checker v2.0.0**, donde se resumen los resultados del escaneo de la biblioteca:
 
 ![Captura de pantalla del informe](https://github.com/Oct4vyus/lrc-checker-jellyfin-navidrome/raw/main/docs/imagenes/lrc-checker-report.png)
-
-
