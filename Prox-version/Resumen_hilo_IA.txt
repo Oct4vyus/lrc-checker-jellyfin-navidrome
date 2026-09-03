@@ -1,0 +1,149 @@
+Resumen del hilo de trabajo sobre IA y mejoras de clasificación en Prox-version
+
+Fecha: 2026-09-02 / 2026-09-03
+Proyecto base: lrc-checker-jellyfin-navidrome
+
+1. Contexto general del proyecto
+- El proyecto original ya hace validación de archivos .lrc sobre música.
+- Actualmente verifica:
+  - si hay audio asociado
+  - si existe .lrc
+  - si el .lrc tiene timestamps
+  - si los timestamps están alineados con la duración del audio
+  - si hay problemas de sincronización y reportes HTML/JSON
+- El código relevante está en:
+  - version_servidor/lrc_checker_server.py
+- La lógica actual se enfoca en sincronización del .lrc con el audio; no en clasificar música por IA.
+
+2. Requerimiento propuesto
+- Mejorar la clasificación de archivos .lrc ya existentes.
+- Casos puntuales planteados:
+  - determinar si una canción es instrumental
+  - si es instrumental, crear el .lrc con texto: "This song is an instrumental."
+  - verificar que los timestamps estén sincronizados
+
+3. Decisión de alcance
+- Se acordó que cualquier cambio se dejaría dentro de la carpeta Prox-version.
+- No se tocaría la versión original del proyecto.
+- La copia de trabajo quedó como una variante independiente para pruebas.
+
+4. Idea de categoría INSTRUMENTAL
+- Se propuso una categoría nueva en el reporte, separada de UNSYNCED.
+- Caso de uso: archivos .lrc sin timestamps, pero con una línea descriptiva tipo:
+  - "This song is an instrumental."
+- Se incluyó una clasificación conservadora para no marcar como instrumental cualquier .lrc sin timestamps que no tenga exactamente ese patrón.
+- La categoría quedó en el estado de análisis del reporte, sin convertirla en un error de sincronización.
+
+5. Regla de detección sugerida
+- Si un .lrc no tiene timestamps y su contenido coincide con una descripción instrumental, se marca como:
+  - INSTRUMENTAL
+- Si no coincide, se mantiene como:
+  - UNSYNCED
+- Esto ayuda a distinguir "música instrumental" de "letra sin sincronizar".
+
+6. Mejora aplicada en Prox-version
+- Se actualizó la lógica del reporte para incluir:
+  - INSTRUMENTAL en JSON
+  - INSTRUMENTAL en HTML
+  - INSTRUMENTAL en reporte de texto
+  - filtro visual del reporte
+  - contabilidad de estadísticas
+  - el porcentaje de cobertura válida ahora considera OK + INSTRUMENTAL
+- Se actualizó la documentación en README.md de Prox-version.
+
+7. IA local vs servicio externo
+Se evaluaron dos caminos:
+
+7.1. IA local
+- Ventajas:
+  - no depende de Internet
+  - más privado
+  - sin costo por uso
+  - más control sobre la ejecución
+- Desventajas:
+  - más peso de imagen/container
+  - requiere modelos pesados y consumen CPU/RAM
+  - más complejidad de setup y entrenamiento
+
+7.2. OpenRouter / API externa
+- Ventajas:
+  - menor peso del contenedor
+  - no requiere modelo local pesado
+  - ideal para casos dudosos o candidatos a instrumental
+- Desventajas:
+  - necesita API Key
+  - envía audio externo
+  - depende de internet y del proveedor
+  - no siempre es preciso para distinguir voz vs instrumental sin validación posterior
+
+8. Propuesta recomendada para futuro
+- Mantener un clasificador local liviano o un proceso externo solo para casos dudosos.
+- Modelo híbrido:
+  - validación local rápida
+  - OpenRouter para confirmar casos ambiguos
+- Regla práctica:
+  - si hay alta confianza en instrumental, crear/proponer .lrc
+  - si hay duda, dejar en REVISAR
+  - no escribir archivos automáticamente sin backup ni confirmación
+
+9. Opción de librosa + modelo entrenado
+- Se analizó como alternativa más liviana que usar IA local pesada.
+- Idea:
+  - librosa extrae características del audio
+  - un modelo entrenado decide si hay voz o no
+- Ventajas:
+  - más pequeño que un modelo de visión/audio pesado
+  - no necesita GPU
+  - fácil de guardar el modelo .joblib
+- Desventajas:
+  - requiere dataset etiquetado
+  - precisión depende mucho de la calidad del entrenamiento
+  - no resuelve verificar sincronización real por sí solo
+
+10. Tamaño aproximado de imagen / contenedor
+- Con librosa + scikit-learn + numpy + scipy:
+  - imagen estimada: ~250-400 MB comprimida
+  - espacio real en Docker: ~500-800 MB
+- La imagen actual con Python + mutagen es mucho más liviana.
+- La IA local pesa mucho más que el contenedor base del proyecto.
+
+11. OpenRouter como solución intermedia
+- Se concluyó que puede ser una buena solución práctica para este caso.
+- Se usaría para analizar solo archivos candidatos y no toda la biblioteca.
+- La idea es:
+  - detectar archivos que están en UNSYNCED / TS 0 / Lín 1
+  - mandar solo esos fragmentos de audio a OpenRouter
+  - obtener respuesta estructurada:
+    - INSTRUMENTAL
+    - CON_LETRA
+    - REVISAR
+  - mostrar la clasificación en el reporte y decidir si crear o no un .lrc
+
+12. Sobre la variante Prox-version-desync-repair
+- Se creó una nueva subcarpeta independiente para probar una mejora adicional:
+  - Prox-version-desync-repair
+- En esa variante, el botón Reparar se habilita también para la categoría DESYNCED.
+- La función reparadora agrega un timestamp final con la duración real del audio.
+- Se reutiliza la misma lógica de reparación ya existente para REVIEW.
+- No se tocó la versión anterior.
+
+13. Estado actual de los archivos
+- En Prox-version se actualizaron:
+  - README.md
+  - version_servidor/lrc_checker_server.py
+- Dockerfile, docker-compose.yml, entrypoint.sh y demás archivos base quedaron tal cual en Prox-version salvo copia inicial.
+- La variante Prox-version-desync-repair contiene otra copia independiente, también con archivos de base replicados.
+
+14. Resultado práctico
+- La propuesta actual más segura para seguir es:
+  1. mantener la categoría INSTRUMENTAL en Prox-version
+  2. usar IA de forma opcional para analizar casos dudosos
+  3. que la IA no escriba archivos automáticamente sin backup ni confirmación
+  4. dejar integración con OpenRouter como segunda fase opcional
+
+15. Conclusión
+- Sí es posible mejorar la clasificación sin sumar un contenedor muy pesado si se usa un modelo externo o un clasificador liviano.
+- La solución más directa y segura para este proyecto es seguir dentro de Prox-version y hacer la IA como una capa extra, no como reemplazo del chequeo actual.
+- La clasificación actual de instrumental por presencia de "This song is an instrumental." es un punto de partida válido, pero no reemplaza a una IA real.
+
+Fin del resumen.
