@@ -151,7 +151,7 @@ docker-compose build
 docker-compose up -d
 
 
-```bash
+```
 
 Luego abrir en el navegador:
 
