@@ -14,10 +14,12 @@ import json
 import re
 import argparse
 import threading
+import mimetypes
+import html as html_module
 from pathlib import Path
 from datetime import datetime
-from dataclasses import dataclass, asdict
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, asdict, field
+from typing import Dict, List, Optional, Tuple
 from enum import Enum
 
 # mutagen para extraer duración de audio
@@ -44,7 +46,7 @@ class CheckStatus(Enum):
     UNSYNCED = "unsynced"        # Archivo .lrc sin timestamps
     CORRUPT = "corrupt"          # Archivo .lrc ilegible o malformado
     DESYNCED = "desynced"        # LRC con diferencia grande respecto al audio (>60s): probable error real
-    REVIEW = "review"            # LRC con diferencia moderada (5-60s): probable outro/fade-out normal
+    REVIEW = "review"            # LRC con diferencia moderada: posible final instrumental o fundido
     NO_AUDIO = "no_audio"        # Archivo .lrc huérfano (sin audio correspondiente)
 
 
@@ -63,12 +65,29 @@ class LrcCheckResult:
     lrc_last_timestamp_sec: Optional[float] = None
     sync_offset_sec: Optional[float] = None  # Diferencia entre último timestamp y duración
     is_signed: bool = False  # True si el .lrc contiene la marca "Oct4vyus Kandle" (ya revisado/corregido)
+    # Metadatos normalizados y valores originales para investigar conflictos.
+    album_directory: str = ""
+    artist: Optional[str] = None
+    album: Optional[str] = None
+    title: Optional[str] = None
+    year: Optional[int] = None
+    track_number: Optional[int] = None
+    disc_number: Optional[int] = None
+    album_identity: str = ""
+    metadata_sources: Dict[str, str] = field(default_factory=dict)
+    warnings: List[str] = field(default_factory=list)
+    lrc_metadata: Dict[str, List[str]] = field(default_factory=dict)
+    raw_lrc_artist: Optional[str] = None
+    raw_lrc_album: Optional[str] = None
+    raw_lrc_title: Optional[str] = None
+    raw_directory_name: Optional[str] = None
+    raw_filename: Optional[str] = None
 
 
 class LrcChecker:
     # Extensiones de audio soportadas
-    AUDIO_EXTENSIONS = {'.mp3', '.flac', '.ogg', '.m4a', '.wma', '.wav',
-                        '.aiff', '.opus', '.wv', '.aac', '.mp4', '.alac'}
+    AUDIO_EXTENSIONS = {'.mp3', '.flac', '.ogg', '.oga', '.m4a', '.wma', '.wav',
+                        '.aiff', '.aif', '.opus', '.wv', '.aac', '.mp4', '.alac'}
     
     # Patrones de timestamp LRC sincronizado
     TIMESTAMP_PATTERNS = [
@@ -103,7 +122,7 @@ class LrcChecker:
         self.sync_tolerance_sec = sync_tolerance_sec
         self.enable_sync_check = enable_sync_check and MUTAGEN_AVAILABLE
         # Umbral desde el cual una diferencia grande se considera error real
-        # en vez de un probable outro/fade-out normal. Ver discusión: esto es
+        # en vez de un posible final instrumental o fundido. Ver discusión: esto es
         # una estimación basada en distribución observada, no un valor exacto.
         self.review_threshold_sec = review_threshold_sec
         # Si no se pasa nada, usa el valor histórico "Oct4vyus Kandle" (compatibilidad
@@ -228,6 +247,191 @@ class LrcChecker:
             return int(match.group(1))
         return 0
 
+    @staticmethod
+    def _normalise_metadata_value(value: str) -> str:
+        """Normaliza espacios sin alterar el valor que se muestra al usuario."""
+        return re.sub(r'\s+', ' ', value).strip()
+
+    def extract_lrc_metadata(self, content: str) -> Dict[str, List[str]]:
+        """Extrae etiquetas LRC conservando todas sus apariciones y valores."""
+        metadata: Dict[str, List[str]] = {}
+        tag_pattern = re.compile(r'^\[([A-Za-z][A-Za-z0-9_-]*):\s*([^\]]*)\]\s*$')
+        for line in content.splitlines():
+            match = tag_pattern.match(line.strip())
+            if not match:
+                continue
+            tag, value = match.groups()
+            tag = tag.lower()
+            metadata.setdefault(tag, []).append(value.strip())
+        return metadata
+
+    @staticmethod
+    def _parse_album_directory(directory_name: str) -> Tuple[Optional[int], Optional[str], Optional[str], List[str]]:
+        """Devuelve año, artista, álbum y advertencias del nombre del directorio.
+
+        No existe una forma universal de distinguir guiones que pertenezcan al
+        artista de los que separan artista y álbum. Se elige el primer separador
+        de forma determinista y se conserva una advertencia cuando la decisión
+        puede ser ambigua.
+        """
+        warnings: List[str] = []
+        raw = directory_name.strip()
+        year: Optional[int] = None
+        remainder = raw
+        year_match = re.match(r'^(?P<year>\d{4})-(?P<rest>.+)$', raw)
+        if year_match and 1000 <= int(year_match.group('year')) <= 2999:
+            year = int(year_match.group('year'))
+            remainder = year_match.group('rest').strip()
+        else:
+            warnings.append("Directorio de álbum sin año válido (formato esperado AÑO-ARTISTA-ÁLBUM)")
+
+        if '-' not in remainder:
+            if remainder:
+                warnings.append("Directorio de álbum ambiguo: no se pudo separar artista y álbum")
+                return year, None, remainder, warnings
+            warnings.append("Directorio de álbum vacío o inválido")
+            return year, None, None, warnings
+
+        artist, album = (part.strip() for part in remainder.split('-', 1))
+        if not artist or not album:
+            warnings.append("Directorio de álbum ambiguo: artista o álbum vacío")
+        if '-' in album:
+            warnings.append(
+                "Directorio de álbum ambiguo: contiene guiones adicionales; "
+                "se separó artista/álbum por el primer guion"
+            )
+        return year, artist or None, album or None, warnings
+
+    @staticmethod
+    def _parse_filename(filename: str) -> Tuple[str, Optional[int], Optional[int], List[str]]:
+        """Extrae título, pista y disco únicamente con prefijos inequívocos."""
+        warnings: List[str] = []
+        stem = Path(filename).stem.strip()
+        title = stem
+        track_number: Optional[int] = None
+        disc_number: Optional[int] = None
+
+        disc_track = re.match(
+            r'^(?P<disc>\d{1,2})\s*[-_.]\s*(?P<track>\d{1,2})'
+            r'\s*(?:[-_.]\s*|\s+)(?P<title>.+)$',
+            stem,
+        )
+        track_match = re.match(
+            r'^(?P<track>\d{1,2})\s*(?:-\s*|[._]\s*|\s+)(?P<title>.+)$',
+            stem,
+        )
+        match = disc_track or track_match
+        if match:
+            candidate_track = int(match.group('track'))
+            if 1 <= candidate_track <= 99:
+                track_number = candidate_track
+                title = match.group('title').strip()
+                if disc_track:
+                    candidate_disc = int(match.group('disc'))
+                    if 1 <= candidate_disc <= 99:
+                        disc_number = candidate_disc
+                    else:
+                        warnings.append("Número de disco fuera de rango; se ignoró")
+            else:
+                warnings.append("Prefijo numérico ambiguo; no se interpretó como número de pista")
+        elif re.match(r'^\d', stem):
+            warnings.append("Prefijo numérico ambiguo; no se interpretó como número de pista")
+        return title, track_number, disc_number, warnings
+
+    def _relative_music_path(self, path: Optional[Path]) -> str:
+        if not path:
+            return ""
+        try:
+            return path.resolve().relative_to(self.music_dir).as_posix()
+        except ValueError:
+            return ""
+
+    def _enrich_result_metadata(
+        self,
+        result: LrcCheckResult,
+        source_path: Path,
+        content: Optional[str] = None,
+    ) -> None:
+        """Completa metadatos desde LRC, directorio y nombre de archivo."""
+        source_path = source_path.resolve()
+        directory_name = source_path.parent.name
+        filename = source_path.name
+        lrc_metadata = self.extract_lrc_metadata(content) if content is not None else {}
+        raw_lrc_artist = next((v for v in lrc_metadata.get('ar', []) if v.strip()), None)
+        raw_lrc_album = next((v for v in lrc_metadata.get('al', []) if v.strip()), None)
+        raw_lrc_title = next((v for v in lrc_metadata.get('ti', []) if v.strip()), None)
+        lrc_artist = self._normalise_metadata_value(raw_lrc_artist) if raw_lrc_artist else None
+        lrc_album = self._normalise_metadata_value(raw_lrc_album) if raw_lrc_album else None
+        lrc_title = self._normalise_metadata_value(raw_lrc_title) if raw_lrc_title else None
+        year, directory_artist, directory_album, directory_warnings = self._parse_album_directory(directory_name)
+        filename_title, track_number, disc_number, filename_warnings = self._parse_filename(filename)
+
+        warnings = list(directory_warnings) + list(filename_warnings)
+        if len([v for v in lrc_metadata.get('ar', []) if v.strip()]) > 1:
+            warnings.append("El LRC contiene múltiples valores [ar:]")
+        if len([v for v in lrc_metadata.get('al', []) if v.strip()]) > 1:
+            warnings.append("El LRC contiene múltiples valores [al:]")
+        if len([v for v in lrc_metadata.get('ti', []) if v.strip()]) > 1:
+            warnings.append("El LRC contiene múltiples valores [ti:]")
+
+        artist = lrc_artist or directory_artist
+        album = lrc_album or directory_album
+        title = lrc_title or filename_title
+        metadata_sources: Dict[str, str] = {}
+        if artist:
+            metadata_sources['artist'] = 'lrc' if lrc_artist else 'album_directory'
+        if album:
+            metadata_sources['album'] = 'lrc' if lrc_album else 'album_directory'
+        if title:
+            metadata_sources['title'] = 'lrc' if lrc_title else 'filename'
+        if year is not None:
+            metadata_sources['year'] = 'album_directory'
+        if track_number is not None:
+            metadata_sources['track_number'] = 'filename'
+        if disc_number is not None:
+            metadata_sources['disc_number'] = 'filename'
+
+        for label, lrc_value, directory_value in (
+            ('artista', lrc_artist, directory_artist),
+            ('álbum', lrc_album, directory_album),
+        ):
+            if lrc_value and directory_value and lrc_value != directory_value:
+                warnings.append(
+                    f"Conflicto de {label}: LRC={lrc_value!r} vs directorio={directory_value!r}"
+                )
+        if lrc_title and filename_title and lrc_title != filename_title:
+            warnings.append(
+                f"Conflicto de título: LRC={lrc_title!r} vs archivo={filename_title!r}"
+            )
+
+        relative_directory = self._relative_music_path(source_path.parent)
+        identity_parts = (
+            relative_directory,
+            str(year) if year is not None else '',
+            artist or '',
+            album or '',
+        )
+        album_identity = '|'.join(identity_parts)
+        if not artist and not album:
+            album_identity = f"{relative_directory}|unknown"
+
+        result.album_directory = relative_directory or directory_name
+        result.artist = artist
+        result.album = album
+        result.title = title
+        result.year = year
+        result.track_number = track_number
+        result.disc_number = disc_number
+        result.album_identity = album_identity
+        result.metadata_sources = metadata_sources
+        result.warnings = warnings
+        result.lrc_metadata = lrc_metadata
+        result.raw_lrc_artist = raw_lrc_artist
+        result.raw_lrc_album = raw_lrc_album
+        result.raw_lrc_title = raw_lrc_title
+        result.raw_directory_name = directory_name
+        result.raw_filename = filename
+
     def has_valid_timestamps(self, content: str) -> Tuple[bool, int, int]:
         """
         Verifica si el contenido tiene timestamps válidos de sincronización.
@@ -269,8 +473,9 @@ class LrcChecker:
         """Analiza un archivo .lrc existente. Si se proporciona audio_path, verifica sincronización."""
         result = LrcCheckResult(
             lrc_file=str(lrc_path),
-            relative_path=str(lrc_path.relative_to(self.music_dir))
+            relative_path=self._relative_music_path(lrc_path)
         )
+        self._enrich_result_metadata(result, audio_path or lrc_path)
         
         # Extraer duración del audio si está disponible
         if audio_path and self.enable_sync_check:
@@ -289,6 +494,8 @@ class LrcChecker:
             result.status = CheckStatus.CORRUPT.value
             result.details = f"No se pudo leer el archivo: {e}"
             return result
+
+        self._enrich_result_metadata(result, audio_path or lrc_path, content)
         
         # Detectar si el archivo ya fue revisado/corregido manualmente (firma)
         result.is_signed = bool(self.signed_marker_pattern.search(content))
@@ -300,8 +507,7 @@ class LrcChecker:
             return result
         
         # Verificar metadatos
-        metadata_matches = self.METADATA_PATTERN.findall(content)
-        result.has_metadata = len(metadata_matches) > 0
+        result.has_metadata = bool(result.lrc_metadata)
         
         # Verificar timestamps
         has_ts, ts_count, line_count = self.has_valid_timestamps(content)
@@ -335,7 +541,13 @@ class LrcChecker:
                 # Verificar si está dentro de la tolerancia
                 abs_offset = abs(result.sync_offset_sec)
                 
-                if abs_offset <= self.sync_tolerance_sec:
+                if result.is_signed:
+                    result.status = CheckStatus.OK.value
+                    result.details = (
+                        f"Firmado: sincronización validada manualmente; último timestamp "
+                        f"{self._fmt_time(last_ts)} vs audio {self._fmt_time(result.audio_duration_sec)}"
+                    )
+                elif abs_offset <= self.sync_tolerance_sec:
                     result.status = CheckStatus.OK.value
                     result.details = (f"Sincronizado OK: último timestamp {self._fmt_time(last_ts)} vs "
                                     f"audio {self._fmt_time(result.audio_duration_sec)} "
@@ -345,8 +557,8 @@ class LrcChecker:
                     direction = "excede" if result.sync_offset_sec < 0 else "es menor que"
                     result.details = (f"REVISAR: último timestamp {self._fmt_time(last_ts)} {direction} "
                                     f"la duración del audio ({self._fmt_time(result.audio_duration_sec)}). "
-                                    f"Diferencia: {abs_offset:.1f}s. Probablemente un outro/fade-out "
-                                    f"instrumental normal, o el tiempo que tarda en cantarse la última línea "
+                                    f"Diferencia: {abs_offset:.1f}s. Posible final instrumental, fundido "
+                                    f"normal o tiempo que tarda en cantarse la última línea "
                                     f"(esto es una estimación, no una certeza: verificar manualmente si dudás).")
                 else:
                     result.status = CheckStatus.DESYNCED.value
@@ -354,7 +566,7 @@ class LrcChecker:
                     result.details = (f"DESINCRONIZADO: último timestamp {self._fmt_time(last_ts)} {direction} "
                                     f"la duración del audio ({self._fmt_time(result.audio_duration_sec)}). "
                                     f"Diferencia: {abs_offset:.1f}s. Diferencia demasiado grande para ser "
-                                    f"solo un outro normal: revisar con prioridad.")
+                                    f"solo un final instrumental o fundido normal: revisar con prioridad.")
             else:
                 # Raro: tiene ts_count > 0 pero no extrajimos ninguno (regex mismatch)
                 result.status = CheckStatus.UNSYNCED.value
@@ -430,6 +642,7 @@ class LrcChecker:
         # Verificar cada archivo de audio
         for i, audio_path in enumerate(audio_files, start=1):
             rel_path = audio_path.relative_to(self.music_dir)
+            relative_path = rel_path.as_posix()
             lrc_path = audio_path.with_suffix('.lrc')
             
             self.log(f"Verificando: {rel_path}")
@@ -440,14 +653,15 @@ class LrcChecker:
                 matched_lrc.add(lrc_path.resolve())
                 result = self.check_lrc_file(lrc_path, audio_path)
                 result.audio_file = str(audio_path)
-                result.relative_path = str(rel_path)
+                result.relative_path = relative_path
             else:
                 result = LrcCheckResult(
                     audio_file=str(audio_path),
-                    relative_path=str(rel_path),
+                    relative_path=relative_path,
                     status=CheckStatus.MISSING.value,
                     details="No se encontró archivo .lrc correspondiente"
                 )
+                self._enrich_result_metadata(result, audio_path)
             
             self.results.append(result)
             self.stats[result.status] = self.stats.get(result.status, 0) + 1
@@ -463,7 +677,7 @@ class LrcChecker:
                     result = self.check_lrc_file(lrc_path)
                     result.status = CheckStatus.NO_AUDIO.value
                     result.details = f"Archivo .lrc huérfano: no hay audio correspondiente"
-                    result.relative_path = str(rel_path)
+                    result.relative_path = rel_path.as_posix()
                     self.results.append(result)
                     self.stats['orphan_lrc'] += 1
                     if result.is_signed:
@@ -503,13 +717,54 @@ class LrcChecker:
             result.details = f"Error al reparar: {e}"
             return False
 
+    def quality_summary(self) -> Dict[str, object]:
+        """Resume problemas de metadatos para revisar bibliotecas grandes."""
+        identities = {
+            r.album_identity for r in self.results
+            if r.album_identity and not r.album_identity.endswith('|unknown')
+        }
+        unknown = len({
+            r.album_identity for r in self.results
+            if not r.artist or not r.album or r.album_identity.endswith('|unknown')
+        })
+        album_names: Dict[str, int] = {}
+        for result in self.results:
+            if result.album:
+                key = result.album.casefold()
+                album_names[key] = album_names.get(key, 0) + 1
+        repeated_names = sorted(
+            result.album for result in self.results
+            if result.album and album_names.get(result.album.casefold(), 0) > 1
+        )
+        warnings = [warning for result in self.results for warning in result.warnings]
+        return {
+            'albums_detected': len(identities),
+            'albums_unknown': unknown,
+            'directories_nonconforming': sum(
+                1 for warning in warnings if warning.startswith('Directorio de álbum')
+            ),
+            'files_without_lrc': self.stats.get('missing', 0),
+            'files_without_lrc_metadata': sum(
+                1 for result in self.results
+                if result.lrc_file and not result.lrc_metadata
+            ),
+            'metadata_conflicts': sum(
+                1 for warning in warnings if warning.startswith('Conflicto')
+            ),
+            'ambiguous_tracks_or_discs': sum(
+                1 for warning in warnings if 'Prefijo numérico ambiguo' in warning
+            ),
+            'orphan_lrc_files': self.stats.get('orphan_lrc', 0),
+            'repeated_album_names': sorted(set(repeated_names), key=str.casefold),
+        }
+
     def generate_json_report(self, output_path: Optional[str] = None) -> str:
         """Genera un reporte en formato JSON."""
         report = {
             'scan_info': {
                 'music_directory': str(self.music_dir),
                 'scanned_at': self.stats['scanned_at'],
-                'scanner_version': '2.0.0',
+                'scanner_version': '4.0.0',
                 'sync_check_enabled': self.enable_sync_check,
                 'sync_tolerance_sec': self.sync_tolerance_sec,
                 'review_threshold_sec': self.review_threshold_sec,
@@ -542,7 +797,7 @@ class LrcChecker:
                     self.stats.get('corrupt', 0)
                 ),
                 # Subconjunto de issues_count que amerita prioridad real,
-                # excluyendo 'review' (probables outros/fade-outs normales).
+                # excluyendo 'review' (posibles finales instrumentales o fundidos normales).
                 'priority_issues_count': (
                     self.stats.get('missing', 0) +
                     self.stats.get('empty', 0) +
@@ -551,6 +806,7 @@ class LrcChecker:
                     self.stats.get('corrupt', 0)
                 ),
             },
+            'quality_summary': self.quality_summary(),
             'results': [asdict(r) for r in self.results]
         }
         
@@ -589,49 +845,114 @@ class LrcChecker:
             'missing': '❌ Falta .lrc',
             'empty': '⚠️ .lrc Vacío',
             'unsynced': '⚠️ Sin Sincronizar',
-            'review': '🟡 Revisar (posible outro)',
+            'review': '🟡 Revisar (posible final instrumental)',
             'desynced': '🔴 Desincronizado',
             'corrupt': '❌ Corrupto',
             'no_audio': 'ℹ️ Huérfano',
         }
         
+        def file_link(path: Optional[str], label: str) -> str:
+            if not path:
+                return '-'
+            relative = self._relative_music_path(Path(path))
+            if not relative:
+                return '-'
+            href = (
+                f"{server_base_url.rstrip('/')}/archivo?path="
+                f"{urllib.parse.quote(relative, safe='')}"
+            )
+            return (
+                f"<a class='file-link' href='{html_module.escape(href, quote=True)}' "
+                f"target='_blank' rel='noopener'>{html_module.escape(label)}</a>"
+            )
+
+        grouped_results: Dict[str, List[LrcCheckResult]] = {}
+        for result in self.results:
+            grouped_results.setdefault(result.album_identity or 'unknown', []).append(result)
+
         rows = ""
-        for r in self.results:
-            status_class = status_classes.get(r.status, '')
-            status_label = status_labels.get(r.status, r.status)
-            audio_name = Path(r.audio_file).name if r.audio_file else '-'
-            lrc_name = Path(r.lrc_file).name if r.lrc_file else '-'
-            
-            # Columna extra de sincronización
-            sync_info = ""
-            if r.audio_duration_sec is not None and r.lrc_last_timestamp_sec is not None:
-                sync_info = f"<span class='sync-badge' title='Audio: {self._fmt_time(r.audio_duration_sec)} | LRC: {self._fmt_time(r.lrc_last_timestamp_sec)}'>Δ{r.sync_offset_sec:+.1f}s</span>"
-            elif r.audio_duration_sec is not None:
-                sync_info = f"<span class='sync-badge muted'>Audio: {self._fmt_time(r.audio_duration_sec)}</span>"
-
-            # Columna de firma (archivo ya revisado/corregido manualmente)
-            signed_class = " row-signed" if r.is_signed else ""
-            signed_info = "<span class='signed-badge' title=\"Contiene la marca de firma\">✍️ Firmado</span>" if r.is_signed else ""
-            
-            # Botón Reparar para archivos en REVIEW o DESYNCED
-            repair_btn = ""
-            if r.status in (CheckStatus.REVIEW.value, CheckStatus.DESYNCED.value) and r.lrc_file:
-                lrc_js = r.lrc_file.replace('\\', '\\\\').replace("'", "\\'")
-                repair_btn = f'<button onclick="repararLrc(\'{lrc_js}\')" class="repair-btn">Reparar</button>'
-
+        for group_index, (identity, group_results) in enumerate(grouped_results.items()):
+            first = group_results[0]
+            if first.album:
+                album_label = html_module.escape(first.album)
+                if first.year is not None:
+                    album_label += f" ({first.year})"
+                if first.artist:
+                    album_label += f" — {html_module.escape(first.artist)}"
+            else:
+                album_label = "Álbum desconocido"
+            album_path = html_module.escape(first.album_directory or 'sin directorio')
+            group_id = f"album-group-{group_index}"
+            group_warnings = sorted({
+                warning for result in group_results for warning in result.warnings
+                if warning.startswith("Conflicto") or "ambiguo" in warning.lower()
+            })
+            warning_html = (
+                f"<div class='album-warning'>⚠️ {html_module.escape(' | '.join(group_warnings))}</div>"
+                if group_warnings else ""
+            )
             rows += f"""
-            <tr class="{status_class}{signed_class}">
-                <td class="status-cell">{status_label}</td>
-                <td title="{r.audio_file or ''}">{audio_name}</td>
-                <td title="{r.lrc_file or ''}">{lrc_name}</td>
-                <td>{r.details}</td>
-                <td class="num">{r.timestamp_count}</td>
-                <td class="num">{r.line_count}</td>
-                <td class="sync-col">{sync_info}</td>
-                <td class="signed-col">{signed_info}</td>
-                <td>{repair_btn}</td>
+            <tr class="album-group-header" data-group="{group_id}">
+                <th colspan="9">Álbum: {album_label}
+                    <small>({album_path})</small>{warning_html}
+                </th>
             </tr>
             """
+            for r in group_results:
+                status_class = status_classes.get(r.status, '')
+                status_label = status_labels.get(r.status, r.status)
+                audio_name = Path(r.audio_file).name if r.audio_file else '-'
+                lrc_name = Path(r.lrc_file).name if r.lrc_file else '-'
+
+                # Columna extra de sincronización
+                sync_info = ""
+                if r.audio_duration_sec is not None and r.lrc_last_timestamp_sec is not None:
+                    sync_info = f"<span class='sync-badge' title='Audio: {self._fmt_time(r.audio_duration_sec)} | LRC: {self._fmt_time(r.lrc_last_timestamp_sec)}'>Δ{r.sync_offset_sec:+.1f}s</span>"
+                elif r.audio_duration_sec is not None:
+                    sync_info = f"<span class='sync-badge muted'>Audio: {self._fmt_time(r.audio_duration_sec)}</span>"
+
+                # Columna de firma (archivo ya revisado/corregido manualmente)
+                signed_class = " row-signed" if r.is_signed else ""
+                signed_info = "<span class='signed-badge' title=\"Contiene la marca de firma\">✍️ Firmado</span>" if r.is_signed else ""
+
+                # Botón Reparar para archivos en REVIEW o DESYNCED
+                repair_btn = ""
+                if r.status in (CheckStatus.REVIEW.value, CheckStatus.DESYNCED.value) and r.lrc_file:
+                    lrc_js = html_module.escape(json.dumps(r.lrc_file), quote=True)
+                    repair_btn = f'<button onclick="repararLrc({lrc_js}, this)" class="repair-btn">Reparar</button>'
+
+                warning_info = ""
+                if r.warnings:
+                    warning_info = (
+                        "<div class='row-warnings'>⚠️ "
+                        + html_module.escape(" | ".join(r.warnings))
+                        + "</div>"
+                    )
+                title_info = html_module.escape(r.title or audio_name)
+                metadata_info = (
+                    f"<div class='metadata-title'>{title_info}</div>"
+                    f"<small>{html_module.escape(r.artist or 'Artista desconocido')} — "
+                    f"{html_module.escape(r.album or 'Álbum desconocido')}</small>"
+                    f"{warning_info}"
+                )
+
+                rows += f"""
+                <tr class="{status_class}{signed_class}" data-group="{group_id}">
+                    <td class="status-cell">{html_module.escape(status_label)}</td>
+                    <td title="{html_module.escape(r.audio_file or '', quote=True)}">
+                        {file_link(r.audio_file, 'Audio')}<br><small>{html_module.escape(audio_name)}</small>
+                    </td>
+                    <td title="{html_module.escape(r.lrc_file or '', quote=True)}">
+                        {file_link(r.lrc_file, 'LRC')}<br><small>{html_module.escape(lrc_name)}</small>
+                    </td>
+                    <td>{metadata_info}<div>{html_module.escape(r.details)}</div></td>
+                    <td class="num">{r.timestamp_count}</td>
+                    <td class="num">{r.line_count}</td>
+                    <td class="sync-col">{sync_info}</td>
+                    <td class="signed-col">{signed_info}</td>
+                    <td>{repair_btn}</td>
+                </tr>
+                """
         
         # Estadísticas
         total = self.stats['total_audio_files']
@@ -647,6 +968,13 @@ class LrcChecker:
         signed = self.stats.get('signed', 0)
         coverage = round(((ok + instrumental) / max(total, 1)) * 100, 1)
         sync_check_badge = "<span class='badge'>con mutagen</span>" if self.enable_sync_check else "<span class='badge warn'>sin mutagen</span>"
+        displayed_scanned_at = self.stats['scanned_at'].replace('T', ' ', 1)
+        server_base_url_js = (
+            json.dumps(server_base_url)
+            .replace('<', '\\u003c')
+            .replace('>', '\\u003e')
+            .replace('&', '\\u0026')
+        )
         
         html = f"""<!DOCTYPE html>
 <html lang="es">
@@ -774,6 +1102,22 @@ class LrcChecker:
         td {{ padding: 10px; border-bottom: 1px solid var(--surface-light); vertical-align: top; }}
         tr:hover {{ background: rgba(108, 92, 231, 0.05); }}
         .num {{ text-align: center; font-variant-numeric: tabular-nums; }}
+        .album-group-header th {{
+            background: #303052;
+            color: var(--text);
+            padding: 10px;
+            text-transform: none;
+            font-size: 0.95rem;
+        }}
+        .album-group-header small {{ color: var(--text-muted); font-weight: normal; }}
+        .album-warning, .row-warnings {{
+            color: var(--empty);
+            font-size: 0.8rem;
+            margin-top: 3px;
+        }}
+        .file-link {{ color: #74b9ff; font-weight: 600; text-decoration: none; }}
+        .file-link:hover {{ text-decoration: underline; }}
+        .metadata-title {{ font-weight: 600; }}
         
         .status-ok {{ border-left: 4px solid var(--ok); }}
         .status-missing {{ border-left: 4px solid var(--missing); }}
@@ -849,8 +1193,8 @@ class LrcChecker:
 <body>
     <div class="container">
         <h1>🎵 LRC Checker Report</h1>
-        <p class="subtitle">{self.music_dir} | Escaneado: {self.stats['scanned_at']}</p>
-        <p class="version">LRC Checker v3.0.0 {sync_check_badge} | Tolerancia OK: {self.sync_tolerance_sec}s | Umbral revisión/error: {self.review_threshold_sec}s</p>
+        <p class="subtitle">{self.music_dir} | Escaneado: {displayed_scanned_at}</p>
+        <p class="version">LRC Checker v4.0.0 {sync_check_badge} | Tolerancia OK: {self.sync_tolerance_sec}s | Umbral revisión/error: {self.review_threshold_sec}s</p>
         
         <div class="stats-grid">
             <div class="stat-card">
@@ -875,7 +1219,7 @@ class LrcChecker:
             </div>
             <div class="stat-card">
                 <div class="number stat-review">{review}</div>
-                <div class="label">Revisar (posible outro)</div>
+                <div class="label">Revisar (posible final instrumental)</div>
             </div>
             <div class="stat-card">
                 <div class="number stat-desynced">{desynced}</div>
@@ -900,17 +1244,17 @@ class LrcChecker:
         </div>
         
         <div class="filters">
-            <button class="active" onclick="filterRows('all')">Todos ({total + orphan})</button>
-            <button onclick="filterRows('ok')">✅ OK ({ok})</button>
-            <button onclick="filterRows('missing')">❌ Missing ({missing})</button>
-            <button onclick="filterRows('empty')">⚠️ Empty ({empty})</button>
-            <button onclick="filterRows('unsynced')">⚠️ Unsynced ({unsynced})</button>
-            <button onclick="filterRows('instrumental')">🎼 INSTRUMENTAL ({instrumental})</button>
-            <button onclick="filterRows('review')">🟡 Revisar ({review})</button>
-            <button onclick="filterRows('desynced')">🔴 Desync ({desynced})</button>
-            <button onclick="filterRows('corrupt')">❌ Corrupt ({corrupt})</button>
-            <button onclick="filterRows('orphan')">ℹ️ Huérfanos ({orphan})</button>
-            <button onclick="filterRows('signed')">✍️ Firmados ({signed})</button>
+            <button class="active" onclick="filterRows('all', this)">Todos ({total + orphan})</button>
+            <button onclick="filterRows('ok', this)">✅ OK ({ok})</button>
+            <button onclick="filterRows('missing', this)">❌ Missing ({missing})</button>
+            <button onclick="filterRows('empty', this)">⚠️ Empty ({empty})</button>
+            <button onclick="filterRows('unsynced', this)">⚠️ Unsynced ({unsynced})</button>
+            <button onclick="filterRows('instrumental', this)">🎼 INSTRUMENTAL ({instrumental})</button>
+            <button onclick="filterRows('review', this)">🟡 Revisar ({review})</button>
+            <button onclick="filterRows('desynced', this)">🔴 Desync ({desynced})</button>
+            <button onclick="filterRows('corrupt', this)">❌ Corrupt ({corrupt})</button>
+            <button onclick="filterRows('orphan', this)">ℹ️ Huérfanos ({orphan})</button>
+            <button onclick="filterRows('signed', this)">✍️ Firmados ({signed})</button>
         </div>
         
         <table id="resultsTable">
@@ -949,22 +1293,28 @@ class LrcChecker:
     </div>
     
     <script>
-        const REPAIR_SERVER_URL = "{server_base_url}";
-        function filterRows(status) {{
+        const REPAIR_SERVER_URL = {server_base_url_js};
+        function filterRows(status, button) {{
             const rows = document.querySelectorAll('#resultsTable tbody tr');
-            const buttons = document.querySelectorAll('.filters button');
-            buttons.forEach(b => b.classList.remove('active'));
-            event.target.classList.add('active');
+            document.querySelectorAll('.filters button').forEach(b => b.classList.remove('active'));
+            button.classList.add('active');
 
             rows.forEach(row => {{
+                if (row.classList.contains('album-group-header')) return;
                 const matches = status === 'all'
                     || (status === 'signed' ? row.classList.contains('row-signed') : row.classList.contains('status-' + status));
                 row.style.display = matches ? '' : 'none';
             }});
+            document.querySelectorAll('.album-group-header').forEach(header => {{
+                const group = header.dataset.group;
+                const hasVisibleRows = Array.from(document.querySelectorAll(
+                    'tr[data-group="' + group + '"]:not(.album-group-header)'
+                )).some(row => row.style.display !== 'none');
+                header.style.display = hasVisibleRows ? '' : 'none';
+            }});
         }}
 
-        function repararLrc(lrcFile) {{
-            const btn = event.target;
+        function repararLrc(lrcFile, btn) {{
             btn.disabled = true;
             btn.textContent = 'Reparando...';
 
@@ -1059,7 +1409,7 @@ class LrcChecker:
         """Genera un reporte de texto simple para logs."""
         lines = [
             "=" * 65,
-            "  LRC CHECKER REPORT v3.0.0",
+            "  LRC CHECKER REPORT v4.0.0",
             "=" * 65,
             f"Directorio: {self.music_dir}",
             f"Escaneado:  {self.stats['scanned_at']}",
@@ -1075,7 +1425,7 @@ class LrcChecker:
             f"    ❌ Sin .lrc:        {self.stats.get('missing', 0)}",
             f"    ⚠️  .lrc Vacíos:    {self.stats.get('empty', 0)}",
             f"    ⚠️  Sin timestamps:  {self.stats.get('unsynced', 0)}",
-            f"    🟡 Revisar (posible outro): {self.stats.get('review', 0)}",
+            f"    🟡 Revisar (posible final instrumental): {self.stats.get('review', 0)}",
             f"    🔴 Desincronizado:  {self.stats.get('desynced', 0)}",
             f"    ❌ Corruptos:       {self.stats.get('corrupt', 0)}",
             f"    ℹ️  Huérfanos:       {self.stats.get('orphan_lrc', 0)}",
@@ -1119,7 +1469,7 @@ Ejemplos:
     parser.add_argument('-v', '--verbose', action='store_true', help='Mostrar progreso en consola')
     parser.add_argument('--no-orphans', action='store_true', help='No verificar archivos .lrc huérfanos')
     parser.add_argument('--tolerance', type=float, default=5.0, help='Tolerancia en segundos para considerar sincronizado (default: 5.0)')
-    parser.add_argument('--review-threshold', type=float, default=60.0, help='Diferencia en segundos a partir de la cual se considera error real en vez de posible outro/fade-out (default: 60.0). Es una estimación, ajustable con prueba y error.')
+    parser.add_argument('--review-threshold', type=float, default=60.0, help='Diferencia en segundos a partir de la cual se considera error real en vez de posible final instrumental o fundido (default: 60.0). Es una estimación, ajustable con prueba y error.')
     parser.add_argument('--no-sync-check', action='store_true', help='Desactivar verificación de duración con audio (solo verifica sintaxis de timestamps)')
     parser.add_argument('--serve', action='store_true', help='Iniciar mini servidor web en el puerto 8080 y quedarse corriendo (modo bajo demanda: sin loop de escaneo periódico)')
     parser.add_argument('--server-url', type=str, default='http://localhost:8080',
@@ -1270,8 +1620,81 @@ try:
                 self._handle_progreso()
             elif parsed.path == '/status':
                 self._send(200, 'ok')
+            elif parsed.path == '/archivo':
+                self._handle_archivo(urllib.parse.parse_qs(parsed.query, keep_blank_values=True))
             else:
-                self._send(404, 'Ruta no encontrada. Usá POST /reparar?archivo=..., POST /escanear o GET /progreso')
+                self._send(404, 'Ruta no encontrada. Usá GET /archivo?path=..., POST /reparar?archivo=..., POST /escanear o GET /progreso')
+
+        def _handle_archivo(self, query):
+            """Sirve únicamente archivos de la biblioteca, sin traversal."""
+            values = query.get('path', [])
+            if len(values) != 1 or not values[0]:
+                self._send(400, 'Falta el parámetro path')
+                return
+            raw_path = values[0]
+            if (
+                '\x00' in raw_path
+                or '\r' in raw_path
+                or '\n' in raw_path
+                or '\\' in raw_path
+                or '..' in raw_path
+                or raw_path.startswith('/')
+                or re.match(r'^[A-Za-z]:', raw_path)
+            ):
+                self._send(403, 'Ruta inválida o no permitida')
+                return
+            parts = raw_path.split('/')
+            if any(not part or part in ('.', '..') for part in parts):
+                self._send(403, 'La ruta debe ser relativa y no puede contener traversal')
+                return
+
+            checker = RepairHandler.checker
+            try:
+                candidate = (checker.music_dir.joinpath(*parts)).resolve()
+                candidate.relative_to(checker.music_dir)
+            except (ValueError, OSError):
+                self._send(403, 'Ruta fuera del directorio de música. Rechazado por seguridad.')
+                return
+            if not candidate.is_file():
+                self._send(404, 'El archivo no existe en la biblioteca')
+                return
+            allowed_extensions = checker.AUDIO_EXTENSIONS | {'.lrc'}
+            if candidate.suffix.lower() not in allowed_extensions:
+                self._send(403, 'Extensión no permitida')
+                return
+
+            content_type = 'text/plain; charset=utf-8'
+            if candidate.suffix.lower() != '.lrc':
+                content_type = {
+                    '.flac': 'audio/flac',
+                    '.mp3': 'audio/mpeg',
+                    '.ogg': 'audio/ogg',
+                    '.oga': 'audio/ogg',
+                    '.opus': 'audio/opus',
+                    '.wav': 'audio/wav',
+                    '.aiff': 'audio/aiff',
+                    '.aif': 'audio/aiff',
+                    '.m4a': 'audio/mp4',
+                    '.mp4': 'audio/mp4',
+                    '.aac': 'audio/aac',
+                    '.alac': 'audio/mp4',
+                    '.wma': 'audio/x-ms-wma',
+                    '.wv': 'audio/wavpack',
+                }.get(candidate.suffix.lower()) or mimetypes.guess_type(candidate.name)[0] or 'application/octet-stream'
+            try:
+                file_size = candidate.stat().st_size
+                self.send_response(200)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(file_size))
+                self.send_header('Content-Disposition', f"inline; filename*=UTF-8''{urllib.parse.quote(candidate.name)}")
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                with candidate.open('rb') as source:
+                    shutil.copyfileobj(source, self.wfile)
+            except (OSError, BrokenPipeError) as error:
+                self.log_message('No se pudo servir %s: %s', candidate, error)
 
         def _handle_reparar(self, query):
             archivo = query.get('archivo', [''])[0]
