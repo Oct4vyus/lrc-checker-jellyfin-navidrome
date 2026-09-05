@@ -5,6 +5,10 @@ Contenedor Docker que permite verificar y corregir archivos `.lrc` (letras sincr
 **Jellyfin** y **Navidrome**. Genera un informe visual (`lrc_report.html`) con categorías de clasificación y herramientas 
 básicas de reparación.
 
+## Plan de la versión 4
+
+La planificación para enriquecer el reporte con metadatos, agrupamiento por álbum y enlaces seguros al `.lrc` y al audio está documentada en [PLAN_VERSION_4.md](PLAN_VERSION_4.md). La propuesta de edición controlada de archivos `.lrc` está documentada en [PLAN_VERSION_5.md](PLAN_VERSION_5.md).
+
 ---
 ## 🔌 Requisitos previos
 
@@ -74,6 +78,29 @@ Sino se establece otra, Oct4vyus Kandle es la firma por defecto.
 - **Barra de progreso**: muestra el porcentaje de archivos en estado ✅ OK respecto al total.  
 - **Botón “Escanear ahora”**: relanza la verificación completa de la biblioteca muestra una barra de progreso.  
 - **Botón “Reparar”** en la categoría 🟡 Revisar y 🔴 Desync: si la sincronización es correcta, mueve el archivo a ✅ OK.  
+
+### Metadatos, grupos y enlaces (v4)
+
+Cada resultado conserva en `lrc_report.json` el artista, álbum, título, año,
+pista y disco normalizados. Se indica la fuente elegida (`lrc`,
+`album_directory` o `filename`), los valores `raw_*` y las advertencias de
+conflictos o nombres ambiguos. El reporte HTML agrupa dentro de cada filtro
+por una identidad estable del álbum (directorio relativo, año, artista y
+álbum); los elementos sin datos aparecen como **Álbum desconocido**.
+
+Los botones **LRC** y **Audio** usan el endpoint controlado:
+
+```text
+GET /archivo?path=Artista/Álbum/Canción.lrc
+GET /archivo?path=Artista/Álbum/Canción.flac
+```
+
+El servidor solo acepta rutas relativas existentes dentro de `MUSIC_DIR`,
+rechaza traversal (`..`) y extensiones no soportadas, y devuelve el MIME del
+archivo. Configurá `SERVER_URL` con la URL que verá el navegador (no
+`localhost` si abrís el HTML desde otra computadora). La reproducción de
+audio depende del formato y del navegador; el enlace sigue permitiendo
+descargar o inspeccionar el archivo.
 
 ---
 ## 📂 Estructura del proyecto

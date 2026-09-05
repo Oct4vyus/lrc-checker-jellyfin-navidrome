@@ -13,7 +13,7 @@ COPY version_servidor/lrc_checker_server.py /app/lrc_checker.py
 # Crear directorios
 RUN mkdir -p /music /reports
 
-# Script de entrada que ejecuta el checker en loop con intervalo configurable
+# Script de entrada que ejecuta el checker en modo servidor bajo demanda
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-# Script de entrada del contenedor LRC Checker v2.1 (modo servidor, bajo demanda)
+# Script de entrada del contenedor LRC Checker v4 (modo servidor, bajo demanda)
 #
 # CAMBIO IMPORTANTE respecto a versiones anteriores: ya NO hay un loop que
 # re-escanea cada INTERVAL_MINUTES. Ahora el contenedor hace UN escaneo
@@ -11,7 +11,7 @@ set -e
 # ejemplo, un cron externo que le pegue a POST /escanear) — no está incluido.
 
 echo "========================================"
-echo "  LRC Checker v2.1 (modo servidor)"
+echo "  LRC Checker v4 (modo servidor)"
 echo "========================================"
 echo "Directorio de música: $MUSIC_DIR"
 echo "Directorio de reportes: $OUTPUT_DIR"
